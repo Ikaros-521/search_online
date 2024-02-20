@@ -156,6 +156,8 @@ if __name__ == '__main__':
       "socks5": "socks://127.0.0.1:10808"
     }
 
+    proxies = None
+
     common = Common()
 
     # 日志文件路径
