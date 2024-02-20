@@ -21,3 +21,8 @@ python运行对应文件即可。
 
 - 2024-2-20
     - 初版发布
+
+# 借鉴项目
+
+- [NetworkPlugin](https://github.com/haikerapples/NetworkPlugin)
+- [chatgptplugin](https://github.com/CatAnd-Dog/chatgptplugin)  
