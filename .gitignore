@@ -1,0 +1,6 @@
+Miniconda3/
+log/*.txt
+
+utils/__pycache__
+
+*.bat
