@@ -53,6 +53,61 @@ def google_2(query):
         results.append(item)
     return results
 
+# 暂不可用
+def bing_1(query):
+    query = query  # 替换为您的搜索关键词
+    url = f"https://www.bing.com/search?q={query}"
+    response = requests.get(url, headers=headers, proxies=proxies)
+    soup = BeautifulSoup(response.content, 'html.parser')
+    results = []
+    for b in soup.find_all('li', class_='b_algo'):
+        anchors = b.find_all('a')
+        if anchors:
+            index = -1
+            for anchor in anchors:
+                if 'href' not in anchor:
+                    index += 1
+                else:
+                    if index == -1:
+                        index = 0
+                    break
+
+            link = anchors[index]['href']
+            title = b.find('h2').text
+            item = {'title': title, 'link': link}
+            results.append(item)
+    for r in results:
+        logging.debug(r['link'])
+    return results
+
+def baidu_1(query):
+    query = query  # 替换为您的搜索关键词
+    url = f"https://www.baidu.com/s?wd={query}"
+    response = requests.get(url, headers=headers, proxies=proxies)
+    soup = BeautifulSoup(response.content, 'html.parser')
+    results = []
+    for b in soup.find_all('div', class_='result'):
+        anchors = b.find_all('a')
+        if anchors:
+            link = anchors[0]['href']
+            title = b.find('h3').text
+            # 处理百度的链接跳转问题，提取真实链接
+            if link.startswith('/link?url='):
+                link = "https://www.baidu.com" + link
+            item = {'title': title, 'link': link}
+            results.append(item)
+    for r in results:
+        logging.debug(r['link'])
+    return results
+
+def search(query, engine='google', id=1):
+    if engine == 'google':
+        return google(query, id)
+    elif engine == 'bing':
+        return bing_1(query)
+    elif engine == 'baidu':
+        return baidu_1(query)
+
 
 def get_url2(url) -> str:
     """Scrape text from a webpage
@@ -91,6 +146,9 @@ def get_url(url):
         return paragraphs_text
     except requests.exceptions.RequestException as e:
         logging.warning("无法访问该URL: %s, error: %s", url, str(e))
+        return None
+    except Exception as e:
+        logging.error(traceback.format_exc())
         return None
 
 
@@ -164,5 +222,8 @@ if __name__ == '__main__':
     file_path = "./log/log-" + common.get_bj_time(1) + ".txt"
     Configure_logger(file_path)
 
-    data_list = google("伊卡洛斯", 1)
+    #data_list = search("伊卡洛斯", 'baidu', 1)
+    #get_summary_list(data_list, 1)
+
+    data_list = search("伊卡洛斯", 'bing', 1)
     get_summary_list(data_list, 1)
