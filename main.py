@@ -1,229 +1,157 @@
 import requests
 from bs4 import BeautifulSoup
-import traceback
 import logging
-from utils.config import Config
-from utils.common import Common
-from utils.logger import Configure_logger
+from typing import List, Dict, Optional
+from functools import lru_cache
 
+class SearchEngine:
+    def __init__(self, headers: Dict[str, str], proxies: Optional[Dict[str, str]] = None):
+        self.headers = headers
+        self.proxies = proxies
 
-def google(query, id=1):
-    if id == 1:
-        return google_1(query)
-    elif id == 2:
-        return google_2(query)
+    @lru_cache(maxsize=100)
+    def search(self, query: str, engine: str = 'google', engine_id: int = 1) -> List[Dict[str, str]]:
+        search_functions = {
+            'google': self._google_search,
+            'bing': self._bing_search,
+            'baidu': self._baidu_search
+        }
+        
+        search_function = search_functions.get(engine.lower())
+        if not search_function:
+            raise ValueError(f"Unsupported search engine: {engine}")
+        
+        return search_function(query, engine_id)
 
-def google_1(query):
-    query = query # 在此处替换您要搜索的关键词
-    url = f"https://www.google.com/search?q={query}"
-    response = requests.get(url, headers=headers, proxies=proxies)
-    soup = BeautifulSoup(response.content, 'html.parser')
-    results = []
-    for g in soup.find_all('div', class_='g'):
-        anchors = g.find_all('a')
-        if anchors:
-            link = anchors[0]['href']
-            if link.startswith('/url?q='):
-                link = link[7:]
-            if not link.startswith('http'):
-                continue
-            title = g.find('h3').text
-            item = {'title': title, 'link': link}
-            results.append(item)
-    for r in results:
-        logging.debug(r['link'])
-    return results
+    def _google_search(self, query: str, engine_id: int) -> List[Dict[str, str]]:
+        if engine_id == 1:
+            url = f"https://www.google.com/search?q={query}"
+            soup = self._get_soup(url)
+            return self._parse_google_results(soup)
+        elif engine_id == 2:
+            url = "https://lite.duckduckgo.com/lite/"
+            data = {"q": query}
+            soup = self._get_soup(url, method='post', data=data)
+            return self._parse_duckduckgo_results(soup)
+        else:
+            raise ValueError(f"Unsupported Google search engine ID: {engine_id}")
 
+    def _bing_search(self, query: str, _: int) -> List[Dict[str, str]]:
+        url = f"https://www.bing.com/search?q={query}"
+        soup = self._get_soup(url)
+        return self._parse_bing_results(soup)
 
-def google_2(query):
-    results = []
-    url = "https://lite.duckduckgo.com/lite/"
+    def _baidu_search(self, query: str, _: int) -> List[Dict[str, str]]:
+        url = f"https://www.baidu.com/s?wd={query}"
+        soup = self._get_soup(url)
+        return self._parse_baidu_results(soup)
 
-    data={
-        "q":query
+    def _get_soup(self, url: str, method: str = 'get', **kwargs) -> BeautifulSoup:
+        try:
+            if method == 'get':
+                response = requests.get(url, headers=self.headers, proxies=self.proxies, timeout=30, **kwargs)
+            elif method == 'post':
+                response = requests.post(url, headers=self.headers, proxies=self.proxies, timeout=30, **kwargs)
+            else:
+                raise ValueError(f"Unsupported HTTP method: {method}")
+            
+            response.raise_for_status()
+            return BeautifulSoup(response.content, 'html.parser')
+        except requests.RequestException as e:
+            logging.error(f"Error fetching URL {url}: {str(e)}")
+            raise
 
-    }
-    response = requests.post(url, data=data, headers=headers, proxies=proxies)
-    response.encoding = "utf-8"
-    soup = BeautifulSoup(response.text, 'html.parser')
-    # soup=soup.find("tbody")
-    for g in soup.find_all("a"):
-        item = {'title': g, 'link': g['href']}
-        logging.debug(g['href'])
-        results.append(item)
-    return results
+    def _parse_google_results(self, soup: BeautifulSoup) -> List[Dict[str, str]]:
+        results = []
+        for g in soup.find_all('div', class_='g'):
+            anchors = g.find_all('a')
+            if anchors:
+                link = anchors[0]['href']
+                if link.startswith('/url?q='):
+                    link = link[7:]
+                if not link.startswith('http'):
+                    continue
+                title = g.find('h3').text
+                results.append({'title': title, 'link': link})
+        return results
 
-# 暂不可用
-def bing_1(query):
-    query = query  # 替换为您的搜索关键词
-    url = f"https://www.bing.com/search?q={query}"
-    response = requests.get(url, headers=headers, proxies=proxies)
-    soup = BeautifulSoup(response.content, 'html.parser')
-    results = []
-    for b in soup.find_all('li', class_='b_algo'):
-        anchors = b.find_all('a')
-        if anchors:
-            index = -1
-            for anchor in anchors:
-                if 'href' not in anchor:
-                    index += 1
-                else:
-                    if index == -1:
-                        index = 0
-                    break
+    def _parse_duckduckgo_results(self, soup: BeautifulSoup) -> List[Dict[str, str]]:
+        results = []
+        for g in soup.find_all("a"):
+            results.append({'title': g.text, 'link': g['href']})
+        return results
 
-            link = anchors[index]['href']
-            title = b.find('h2').text
-            item = {'title': title, 'link': link}
-            results.append(item)
-    for r in results:
-        logging.debug(r['link'])
-    return results
+    def _parse_bing_results(self, soup: BeautifulSoup) -> List[Dict[str, str]]:
+        results = []
+        for b in soup.find_all('li', class_='b_algo'):
+            anchors = b.find_all('a')
+            if anchors:
+                link = next((a['href'] for a in anchors if 'href' in a.attrs), None)
+                if link:
+                    title = b.find('h2').text
+                    results.append({'title': title, 'link': link})
+        return results
 
-def baidu_1(query):
-    query = query  # 替换为您的搜索关键词
-    url = f"https://www.baidu.com/s?wd={query}"
-    response = requests.get(url, headers=headers, proxies=proxies)
-    soup = BeautifulSoup(response.content, 'html.parser')
-    results = []
-    for b in soup.find_all('div', class_='result'):
-        anchors = b.find_all('a')
-        if anchors:
-            link = anchors[0]['href']
-            title = b.find('h3').text
-            # 处理百度的链接跳转问题，提取真实链接
-            if link.startswith('/link?url='):
-                link = "https://www.baidu.com" + link
-            item = {'title': title, 'link': link}
-            results.append(item)
-    for r in results:
-        logging.debug(r['link'])
-    return results
+    def _parse_baidu_results(self, soup: BeautifulSoup) -> List[Dict[str, str]]:
+        results = []
+        for b in soup.find_all('div', class_='result'):
+            anchors = b.find_all('a')
+            if anchors:
+                link = anchors[0]['href']
+                title = b.find('h3').text
+                if link.startswith('/link?url='):
+                    link = "https://www.baidu.com" + link
+                results.append({'title': title, 'link': link})
+        return results
 
-def search(query, engine='google', id=1):
-    if engine == 'google':
-        return google(query, id)
-    elif engine == 'bing':
-        return bing_1(query)
-    elif engine == 'baidu':
-        return baidu_1(query)
+    def get_content(self, url: str) -> Optional[str]:
+        try:
+            soup = self._get_soup(url)
+            paragraphs = soup.find_all(['p', 'span'])
+            content = ' '.join([p.get_text() for p in paragraphs])
+            return self._trim_content(content)
+        except Exception as e:
+            logging.error(f"Error fetching content from {url}: {str(e)}")
+            return None
 
+    @staticmethod
+    def _trim_content(content: str, max_length: int = 8000) -> str:
+        if len(content) <= max_length:
+            return content
+        start = (len(content) - max_length) // 2
+        return content[start:start + max_length]
 
-def get_url2(url) -> str:
-    """Scrape text from a webpage
+    def get_summaries(self, query: str, engine: str = 'google', engine_id: int = 1, count: int = 3) -> List[str]:
+        search_results = self.search(query, engine, engine_id)
+        summaries = []
+        for result in search_results[:count]:
+            content = self.get_content(result['link'])
+            if content and len(content) >= 50:
+                summaries.append(content)
+        return summaries
 
-    Args:
-        url (str): The URL to scrape text from
-
-    Returns:
-        str: The scraped text
-    """
-
-    try:
-        response = requests.get(url, headers=headers, proxies=proxies, timeout=30)
-        if response.encoding == "ISO-8859-1": response.encoding = response.apparent_encoding
-    except Exception as e:
-        logging.debug(traceback.format_exc())
-        return "无法连接到该网页"
-    soup = BeautifulSoup(response.text, "html.parser")
-    for script in soup(["script", "style"]):
-        script.extract()
-    text = soup.get_text()
-    lines = (line.strip() for line in text.splitlines())
-    chunks = (phrase.strip() for line in lines for phrase in line.split("  "))
-    text = "\n".join(chunk for chunk in chunks if chunk)
-    return text
-
-
-def get_url(url):
-    try:
-        response = requests.get(url, headers=headers, proxies=proxies, timeout=30)
-        response.raise_for_status()
-        html = response.text
-        soup = BeautifulSoup(html, 'html.parser')
-        paragraphs = soup.find_all(['p', 'span'])
-        paragraphs_text = [p.get_text() for p in paragraphs]
-        return paragraphs_text
-    except requests.exceptions.RequestException as e:
-        logging.warning("无法访问该URL: %s, error: %s", url, str(e))
-        return None
-    except Exception as e:
-        logging.error(traceback.format_exc())
-        return None
-
-
-def get_summary(item):
-    logging.debug("正在获取链接内容：%s", item["link"])
-    link_content = get_url(item["link"])
-    if not link_content:
-        logging.warning("无法获取链接内容：%s", item["link"])
-        return None
-    logging.debug("link_content: %s", link_content)
-    # 获取链接内容字符数量
-    link_content_str = ' '.join(link_content)
-    content_length = len(link_content_str)
-    logging.debug("content_length: %s", content_length)
-
-    # 如果内容少于50个字符，则pass
-    if content_length < 50:
-        logging.warning("链接内容低于50个字符：%s", item["link"])
-        return None
-    # 如果内容大于15000个字符，则截取中间部分
-    elif content_length > 8000:
-        logging.warning("链接内容高于15000个字符，进行裁断：%s", item["link"])
-        start = (content_length - 8000) // 2
-        end = start + 8000
-        link_content = link_content[start:end]
-
-    resp_content = ""
-    for content in link_content:
-        resp_content += content.rstrip()
-
-    logging.debug("正在提取摘要：%s", resp_content)
-    return resp_content
-
-
-def get_summary_list(data_list, count=3):
-    num = 0
-    summary_list = []
-
-    logging.info(f"data_list={data_list}")
-
-    for data in data_list:
-        summary = get_summary(data)
-        if summary:
-            summary_list.append(summary)
-            num += 1
-
-        if num >= count:
-            break
-
-    logging.info(f"summary_list={summary_list}")
-    return summary_list
-
-
-if __name__ == '__main__':
+def main():
     headers = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36 Edg/121.0.0.0',
         'Content-Type': 'text/plain',
     }
+    proxies = None  # 如果需要代理，请取消注释并填写正确的代理信息
+    # proxies = {
+    #     "http": "http://127.0.0.1:10809",
+    #     "https": "http://127.0.0.1:10809",
+    #     "socks5": "socks://127.0.0.1:10808"
+    # }
 
-    proxies = {
-      "http": "http://127.0.0.1:10809",
-      "https": "http://127.0.0.1:10809",
-      "socks5": "socks://127.0.0.1:10808"
-    }
+    search_engine = SearchEngine(headers, proxies)
+    query = "伊卡洛斯"
+    engine = "baidu"
+    engine_id = 1
+    count = 3
 
-    proxies = None
+    summaries = search_engine.get_summaries(query, engine, engine_id, count)
+    for i, summary in enumerate(summaries, 1):
+        print(f"Summary {i}:\n{summary}\n")
 
-    common = Common()
-
-    # 日志文件路径
-    file_path = "./log/log-" + common.get_bj_time(1) + ".txt"
-    Configure_logger(file_path)
-
-    #data_list = search("伊卡洛斯", 'baidu', 1)
-    #get_summary_list(data_list, 1)
-
-    data_list = search("伊卡洛斯", 'bing', 1)
-    get_summary_list(data_list, 1)
+if __name__ == '__main__':
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+    main()
