@@ -15,7 +15,7 @@ python：3.10.10
 
 ## 运行
 
-python运行对应文件即可。  
+修改main中相关参数，`python main.py`即可。  
 
 # 更新日志
 
