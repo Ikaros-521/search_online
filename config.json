@@ -1,0 +1,17 @@
+{
+  "engine": "baidu",
+  "engine_id": 1,
+  "engine_priority": ["baidu", "sogou", "bing", "so"],
+  "count": 3,
+  "proxies": {
+    "http": "",
+    "https": ""
+  },
+  "request": {
+    "timeout": 30,
+    "max_retries": 3,
+    "retry_backoff": 1,
+    "min_content_length": 200,
+    "max_content_length": 8000
+  }
+}

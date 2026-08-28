@@ -1,14 +1,27 @@
 import json
+import os
+from typing import Any, Optional
+
+
+def load_config(config_file: str = "config.json") -> dict:
+    """
+    加载配置文件，文件不存在或格式错误时返回空字典。
+
+    :param config_file: 配置文件路径
+    :return: 配置字典
+    """
+    if not os.path.exists(config_file):
+        return {}
+    try:
+        with open(config_file, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    except (json.JSONDecodeError, OSError) as e:
+        print(f"配置文件 {config_file} 解析失败：{e}")
+        return {}
+
 
 class Config:
-    # 单例模式
-    # _instance = None
     config = None
-
-    # def __new__(cls, *args, **kwargs):
-    #     if not cls._instance:
-    #         cls._instance = super(Config, cls).__new__(cls)  # 不再传递 *args, **kwargs
-    #     return cls._instance
 
     def __init__(self, config_file):
         if self.config is None:

@@ -5,6 +5,8 @@ from typing import List, Dict, Optional
 from functools import lru_cache
 from urllib.parse import quote_plus, urlparse, parse_qs, unquote
 import time
+import re
+import base64
 
 
 class SearchEngineError(Exception):
@@ -40,15 +42,30 @@ class SearchEngine:
         'baike.baidu.com',     # 百度百科被反爬拦截（403）
     })
 
-    def __init__(self, headers: Optional[Dict[str, str]] = None, proxies: Optional[Dict[str, str]] = None):
+    def __init__(self, headers: Optional[Dict[str, str]] = None, proxies: Optional[Dict[str, str]] = None,
+                 config: Optional[Dict] = None):
         """
         初始化搜索引擎实例。
 
         :param headers: 请求头，用于模拟浏览器行为（未提供时使用默认值）
         :param proxies: 代理设置（可选）
+        :param config: 配置字典（可选），支持 timeout/max_retries/阈值等
         """
+        config = config or {}
+        request_cfg = config.get('request', {}) if isinstance(config, dict) else {}
+
         self.headers = {**self.DEFAULT_HEADERS, **(headers or {})}
         self.proxies = proxies
+        if not self.proxies and isinstance(config, dict):
+            proxies_cfg = config.get('proxies', {}) or {}
+            self.proxies = {k: v for k, v in proxies_cfg.items() if v} or None
+
+        # 从配置读取请求参数
+        self.timeout = request_cfg.get('timeout', self.DEFAULT_TIMEOUT)
+        self.max_retries = request_cfg.get('max_retries', self.MAX_RETRIES)
+        self.retry_backoff = request_cfg.get('retry_backoff', self.RETRY_BACKOFF)
+        self.min_content_length = request_cfg.get('min_content_length', self.MIN_CONTENT_LENGTH)
+        self.max_content_length = request_cfg.get('max_content_length', 8000)
 
     @lru_cache(maxsize=100)
     def search(self, query: str, engine: str = 'google', engine_id: int = 1) -> List[Dict[str, str]]:
@@ -63,7 +80,9 @@ class SearchEngine:
         search_functions = {
             'google': self._google_search,
             'bing': self._bing_search,
-            'baidu': self._baidu_search
+            'baidu': self._baidu_search,
+            'sogou': self._sogou_search,
+            'so': self._so_search,
         }
 
         search_function = search_functions.get(engine.lower())
@@ -94,6 +113,23 @@ class SearchEngine:
         soup = self._get_soup(url)
         return self._parse_bing_results(soup)
 
+    def _sogou_search(self, query: str, _: int) -> List[Dict[str, str]]:
+        """执行搜狗搜索。跳转链接 /link?url= 页面含 window.location.replace，正则提取真实URL"""
+        encoded_query = quote_plus(query)
+        url = f"https://www.sogou.com/web?query={encoded_query}"
+        soup = self._get_soup(url)
+        # 搜狗反爬会返回验证码类页面
+        if self._is_captcha_page(soup):
+            raise SearchEngineBlockedError(f"搜狗搜索被验证码拦截，请稍后重试或切换搜索引擎。查询词：{query}")
+        return self._parse_sogou_results(soup)
+
+    def _so_search(self, query: str, _: int) -> List[Dict[str, str]]:
+        """执行360搜索。直接https链接可用；/link?m=加密跳转无法解析，跳过"""
+        encoded_query = quote_plus(query)
+        url = f"https://www.so.com/s?q={encoded_query}"
+        soup = self._get_soup(url)
+        return self._parse_so_results(soup)
+
     def _baidu_search(self, query: str, _: int) -> List[Dict[str, str]]:
         """执行百度搜索"""
         encoded_query = quote_plus(query)
@@ -118,7 +154,7 @@ class SearchEngine:
         """
         last_exception = None
 
-        for attempt in range(1, self.MAX_RETRIES + 1):
+        for attempt in range(1, self.max_retries + 1):
             try:
                 response = self._do_request(url, method, **kwargs)
                 self._check_content_type(response, url)
@@ -131,15 +167,15 @@ class SearchEngine:
                     raise
                 # 5xx 服务器错误，继续重试
                 last_exception = e
-                logger.warning(f"HTTP {e.response.status_code} 访问 {url}，第 {attempt}/{self.MAX_RETRIES} 次重试")
+                logger.warning(f"HTTP {e.response.status_code} 访问 {url}，第 {attempt}/{self.max_retries} 次重试")
 
             except requests.exceptions.ConnectionError as e:
                 last_exception = e
-                logger.warning(f"连接错误访问 {url}，第 {attempt}/{self.MAX_RETRIES} 次重试: {e}")
+                logger.warning(f"连接错误访问 {url}，第 {attempt}/{self.max_retries} 次重试: {e}")
 
             except requests.exceptions.Timeout as e:
                 last_exception = e
-                logger.warning(f"超时访问 {url}，第 {attempt}/{self.MAX_RETRIES} 次重试: {e}")
+                logger.warning(f"超时访问 {url}，第 {attempt}/{self.max_retries} 次重试: {e}")
 
             except requests.exceptions.RequestException as e:
                 # 其他请求异常不重试
@@ -147,8 +183,8 @@ class SearchEngine:
                 raise
 
             # 指数退避
-            if attempt < self.MAX_RETRIES:
-                wait_time = self.RETRY_BACKOFF * (2 ** (attempt - 1))
+            if attempt < self.max_retries:
+                wait_time = self.retry_backoff * (2 ** (attempt - 1))
                 logger.info(f"等待 {wait_time}s 后重试...")
                 time.sleep(wait_time)
 
@@ -158,9 +194,9 @@ class SearchEngine:
     def _do_request(self, url: str, method: str = 'get', **kwargs) -> requests.Response:
         """执行单次 HTTP 请求"""
         if method == 'get':
-            response = requests.get(url, headers=self.headers, proxies=self.proxies, timeout=self.DEFAULT_TIMEOUT, **kwargs)
+            response = requests.get(url, headers=self.headers, proxies=self.proxies, timeout=self.timeout, **kwargs)
         elif method == 'post':
-            response = requests.post(url, headers=self.headers, proxies=self.proxies, timeout=self.DEFAULT_TIMEOUT, **kwargs)
+            response = requests.post(url, headers=self.headers, proxies=self.proxies, timeout=self.timeout, **kwargs)
         else:
             raise ValueError(f"不支持的HTTP方法：{method}")
 
@@ -285,8 +321,6 @@ class SearchEngine:
     @staticmethod
     def _decode_bing_url(bing_href: str) -> Optional[str]:
         """从 Bing tracking link 中解码出真实URL（base64编码在 u= 参数中）"""
-        import base64
-
         parsed = urlparse(bing_href)
         params = parse_qs(parsed.query)
         if 'u' not in params:
@@ -364,6 +398,118 @@ class SearchEngine:
 
         return results
 
+    def _parse_sogou_results(self, soup: BeautifulSoup) -> List[Dict[str, str]]:
+        """解析搜狗搜索结果。直接使用 https 开头的真实URL（搜狗已改为直链输出）"""
+        results = []
+        seen_titles = set()
+        
+        for res in soup.find_all('div', class_='vrwrap'):
+            h3 = res.find('h3')
+            if not h3:
+                continue
+            
+            title = h3.get_text(strip=True)
+            if not title or len(title) < 2:
+                continue
+            
+            if title in seen_titles:
+                continue
+            
+            # 找第一个真实的 https 链接（跳过 javascript 和内部搜索链接）
+            real_url = None
+            for a in res.find_all('a', href=True):
+                href = a['href']
+                # 只接受外部站点的 https 链接，排除内部导航和搜狗搜索
+                if (href.startswith('https://') 
+                    and 'sogou.com/web?' not in href 
+                    and 'javascript' not in href):
+                    real_url = href
+                    break
+            
+            if real_url:
+                seen_titles.add(title)
+                results.append({'title': title, 'link': real_url})
+        
+        return results
+
+    def _parse_so_results(self, soup: BeautifulSoup) -> List[Dict[str, str]]:
+        """解析360搜索。直接https链接可用；/link?m=加密跳转无法解析，跳过"""
+        results = []
+        seen_titles = set()
+        
+        for li in soup.find_all('li', class_='res-list'):
+            h3 = li.find('h3')
+            if not h3:
+                continue
+            
+            title = h3.get_text(strip=True)
+            if not title or len(title) < 2:
+                continue
+            
+            if title in seen_titles:
+                continue
+            
+            a = h3.find('a')
+            if not a or 'href' not in a.attrs:
+                continue
+            
+            href = a['href']
+            
+            # 只接受直接的 https 链接，跳过 /link?m= 等加密跳转
+            if href.startswith('http'):
+                seen_titles.add(title)
+                results.append({'title': title, 'link': href})
+        
+        return results
+
+    def search_with_fallback(self, query: str, engine_priority: Optional[List[str]] = None, engine_id: int = 1, count: int = 3) -> List[Dict[str, str]]:
+        """
+        按优先级顺序尝试多个搜索引擎，自动降级。
+        
+        :param query: 搜索查询
+        :param engine_priority: 引擎优先级列表，如 ['baidu', 'sogou', 'bing']
+        :param engine_id: 搜索引擎ID（仅对Google有效）
+        :param count: 需要获取的摘要数量（传递给 get_summaries 使用）
+        :return: 首次成功获取的结果列表
+        """
+        engines = engine_priority or ['baidu', 'sogou', 'bing', 'so']
+        last_exception = None
+        
+        for eng_name in engines:
+            try:
+                logger.info(f"尝试搜索（引擎：{eng_name}）...")
+                results = self.search(query, engine=eng_name, engine_id=engine_id)
+                if results:
+                    logger.info(f"{eng_name} 搜索成功，获取 {len(results)} 条结果")
+                    return results
+                else:
+                    logger.warning(f"{eng_name} 未返回任何结果")
+                    
+            except SearchEngineBlockedError as e:
+                logger.warning(f"[被拦截] {str(e)[:60]}...")
+                last_exception = e
+            except Exception as e:
+                logger.error(f"{eng_name} 搜索失败：{e}")
+                last_exception = e
+        
+        # 所有引擎都失败了
+        raise last_exception  # type: ignore[misc]
+    
+    def get_summaries_with_fallback(self, query: str, engine_priority: Optional[List[str]] = None, count: int = 3) -> List[str]:
+        """使用降级机制获取摘要（任一引擎成功即可）"""
+        for eng_name in engine_priority or ['baidu', 'sogou', 'bing', 'so']:
+            try:
+                logger.info(f"尝试获取摘要（引擎：{eng_name}）...")
+                summaries = self.get_summaries(query, engine=eng_name, count=count)
+                if summaries:
+                    logger.info(f"{eng_name} 成功获取 {len(summaries)} 条摘要")
+                    return summaries
+            except Exception as e:
+                logger.warning(f"{eng_name} 获取摘要失败：{e}")
+        
+        # 全部失败
+        return []
+
     def get_content(self, url: str) -> Optional[str]:
         """
         获取网页内容。自动跟随 HTTP 302 重定向（百度/必应的跳转链接），过滤非 HTML 内容和广告空壳页。
@@ -374,7 +520,7 @@ class SearchEngine:
         try:
             sess = requests.Session()
             sess.headers.update(self.headers)
-            response = sess.get(url, timeout=self.DEFAULT_TIMEOUT, allow_redirects=True)
+            response = sess.get(url, timeout=self.timeout, allow_redirects=True)
 
             content_type = response.headers.get('Content-Type', '')
             # 只处理 HTML 内容，跳过 PDF、图片等非 HTML 资源
@@ -400,7 +546,7 @@ class SearchEngine:
             content = ' '.join(text_parts)
 
             # 内容过短视为垃圾页面（广告空壳、登录页等）
-            if len(content) < self.MIN_CONTENT_LENGTH:
+            if len(content) < self.min_content_length:
                 logger.debug(f"内容太短({len(content)}字)，过滤：{url[:60]}...")
                 return None
 
@@ -444,21 +590,25 @@ class SearchEngine:
 
 def main():
     """主函数，演示搜索引擎的使用"""
-    # headers 已在 SearchEngine 中使用默认值，可按需覆盖
-    proxies = None  # 如果需要代理，请取消注释并填写正确的代理信息
-    # proxies = {
-    #     "http": "http://127.0.0.1:10809",
-    #     "https": "http://127.0.0.1:10809"
-    # }
-
-    search_engine = SearchEngine(proxies=proxies)
-    query = "伊卡洛斯"
-    engine = "baidu"
-    engine_id = 1
-    count = 3
-
-    logger.info(f"开始搜索：{query}（使用{engine}引擎）")
-    summaries = search_engine.get_summaries(query, engine, engine_id, count)
+    # 加载配置文件
+    from utils.config import load_config
+    
+    config = load_config("config.json") or {}
+    
+    # 从配置读取参数
+    query = "伊卡洛斯"  # 默认查询词，可按需修改
+    engine_priority = config.get('engine_priority', ['baidu', 'sogou', 'bing', 'so'])
+    count = config.get('count', 3)
+    
+    logger.info(f"开始搜索：{query}")
+    logger.info(f"引擎优先级：{engine_priority}")
+    
+    summaries = search_engine.get_summaries_with_fallback(query, engine_priority=engine_priority, count=count)
+    
+    if not summaries:
+        logger.warning("所有引擎均未能获取摘要")
+        return
+    
     for i, summary in enumerate(summaries, 1):
         logger.info(f"摘要 {i}:\n{summary}\n")
 
