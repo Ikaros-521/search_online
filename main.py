@@ -196,65 +196,125 @@ class SearchEngine:
         return results
 
     def _parse_bing_results(self, soup: BeautifulSoup) -> List[Dict[str, str]]:
-        """解析Bing搜索结果"""
+        """解析Bing搜索结果。从 tracking link 的 u= 参数中用 base64 解码出真实URL"""
         results = []
-        for b in soup.find_all('li', class_='b_algo'):
-            anchors = b.find_all('a')
-            if anchors:
-                link = next((a['href'] for a in anchors if 'href' in a.attrs), None)
-                if link:
-                    h2_tag = b.find('h2')
-                    if not h2_tag:
-                        continue  # 跳过没有标题的结果
-                    title = h2_tag.text
-                    results.append({'title': title, 'link': link})
-        return results
+        seen_titles = set()
 
-    def _parse_baidu_results(self, soup: BeautifulSoup) -> List[Dict[str, str]]:
-        """解析百度搜索结果"""
-        results = []
-        # 百度实际使用的结果类名：result-op 和 c-container
-        for b in soup.find_all('div', class_=lambda c: c and c in ('result-op', 'c-container')):
-            # result-op 通常直接有 h3，c-container 需要额外判断
-            title_tag = b.find('h3')
-            if not title_tag:
-                continue  # 跳过没有标题的结果
-
-            anchors = b.find_all('a')
-            if not anchors:
+        for li in soup.find_all('li', class_='b_algo'):
+            h2_tag = li.find('h2')
+            if not h2_tag:
                 continue
 
-            link = anchors[0]['href']
-            title = title_tag.text
+            title = h2_tag.get_text(strip=True)
+            if not title or len(title) < 2:
+                continue
 
-            # 处理百度的链接跳转问题
-            if link.startswith('/link?url='):
-                link = "https://www.baidu.com" + link
-            elif link.startswith('/url?'):
-                # /url?q=xxx&sa=... 格式
-                from urllib.parse import urlparse, parse_qs
-                parsed = urlparse(link)
-                params = parse_qs(parsed.query)
-                if 'q' in params:
-                    link = params['q'][0]
-                else:
-                    continue
+            # 用 title 去重
+            if title in seen_titles:
+                continue
 
-            results.append({'title': title, 'link': link})
+            link_tag = h2_tag.find('a')
+            if not link_tag or 'href' not in link_tag.attrs:
+                continue
+
+            href = link_tag['href']
+
+            # 从 bing tracking link 中解码真实URL
+            real_url = self._decode_bing_url(href)
+            if not real_url:
+                continue
+
+            seen_titles.add(title)
+            results.append({'title': title, 'link': real_url})
+
+        return results
+
+    @staticmethod
+    def _decode_bing_url(bing_href: str) -> Optional[str]:
+        """从 Bing tracking link 中解码出真实URL（base64编码在 u= 参数中）"""
+        from urllib.parse import urlparse, parse_qs, unquote
+        import base64
+
+        parsed = urlparse(bing_href)
+        params = parse_qs(parsed.query)
+        if 'u' not in params:
+            return None
+
+        encoded = params['u'][0]
+        if not encoded.startswith('a1'):
+            return None
+
+        try:
+            decoded_bytes = base64.urlsafe_b64decode(encoded[2:] + '==')
+            return unquote(decoded_bytes.decode('utf-8'))
+        except Exception:
+            logger.debug(f"Bing URL 解码失败：{encoded[:50]}...")
+            return None
+
+    def _parse_baidu_results(self, soup: BeautifulSoup) -> List[Dict[str, str]]:
+        """解析百度搜索结果。百度搜索返回的URL是跳转中间页，保留即可——get_content请求时会自动跟随302重定向到真实页面"""
+        results = []
+        seen_titles = set()
+
+        content_left = soup.find('div', id='content_left')
+        if not content_left:
+            logger.warning('百度搜索结果中未找到 content_left 区域')
+            return results
+
+        for child in content_left.children:
+            if child.name not in ('div', 'td', 'table'):
+                continue
+
+            title_tag = child.find('h3')
+            if not title_tag:
+                continue
+
+            title = title_tag.get_text(strip=True)
+            if not title or len(title) < 2:
+                continue
+
+            # 用 title 去重
+            if title in seen_titles:
+                continue
+
+            # 查找包含跳转链接的 a 标签 (/link?url= 或 /baidu.php?url=)
+            real_link = None
+            for a in child.find_all('a', href=True):
+                href = a['href']
+                if '/link?url=' in href or '/baidu.php?url=' in href:
+                    real_link = href
+                    break
+
+            if real_link:
+                seen_titles.add(title)
+                results.append({'title': title, 'link': real_link})
+
         return results
 
     def get_content(self, url: str) -> Optional[str]:
         """
-        获取网页内容。
+        获取网页内容。自动跟随 HTTP 302 重定向（百度/必应的跳转链接），过滤非 HTML 内容。
 
-        :param url: 目标URL
-        :return: 网页内容文本，如果发生错误则返回None
+        :param url: 目标URL（支持搜索结果的中间跳转页）
+        :return: 网页内容文本，如果发生错误或非HTML内容则返回None
         """
         try:
-            soup = self._get_soup(url)
+            sess = requests.Session()
+            sess.headers.update(self.headers)
+            # follow_redirects=True 会自动跟踪百度的 /link?url= 和 /baidu.php?url=
+            response = sess.get(url, timeout=self.DEFAULT_TIMEOUT, allow_redirects=True)
+
+            content_type = response.headers.get('Content-Type', '')
+            # 只处理 HTML 和 UTF-8 编码的内容，跳过 PDF、图片等非 HTML 资源
+            if 'text/html' not in content_type and 'application/xhtml' not in content_type:
+                logger.debug(f"跳过非HTML内容：{url} (Content-Type: {content_type})")
+                return None
+
+            soup = BeautifulSoup(response.content, 'html.parser')
             # 移除脚本和样式标签
             for tag in soup(['script', 'style']):
                 tag.extract()
+
             paragraphs = soup.find_all(['p', 'span'])
             content = ' '.join([p.get_text() for p in paragraphs])
             return self._trim_content(content)
