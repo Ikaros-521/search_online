@@ -37,3 +37,7 @@ def Configure_logger(log_file):
 
     # 将处理程序添加到记录器，并设置格式化器
     handler.setFormatter(formatter)
+
+    # 注册到 root logger
+    logging.root.addHandler(handler)
+    logging.root.addHandler(console)
