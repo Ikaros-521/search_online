@@ -3,8 +3,18 @@ from bs4 import BeautifulSoup
 from loguru import logger
 from typing import List, Dict, Optional
 from functools import lru_cache
-from urllib.parse import quote_plus
+from urllib.parse import quote_plus, urlparse, parse_qs, unquote
 import time
+
+
+class SearchEngineError(Exception):
+    """搜索引擎基类异常"""
+    pass
+
+
+class SearchEngineBlockedError(SearchEngineError):
+    """搜索被反爬机制拦截（如验证码）"""
+    pass
 
 
 class SearchEngine:
@@ -22,6 +32,13 @@ class SearchEngine:
     DEFAULT_TIMEOUT = 30
     MAX_RETRIES = 3
     RETRY_BACKOFF = 1  # 秒，指数退避基数
+    MIN_CONTENT_LENGTH = 200  # 最低有效内容长度（字符数），低于此值视为垃圾内容
+
+    # 域名黑白名单 - 用于过滤广告和低质量站点
+    # 黑名单中的域名的链接会被跳过（如推广页、反爬站）
+    _BLOCKED_DOMAINS = frozenset({
+        'baike.baidu.com',     # 百度百科被反爬拦截（403）
+    })
 
     def __init__(self, headers: Optional[Dict[str, str]] = None, proxies: Optional[Dict[str, str]] = None):
         """
@@ -82,6 +99,12 @@ class SearchEngine:
         encoded_query = quote_plus(query)
         url = f"https://www.baidu.com/s?wd={encoded_query}"
         soup = self._get_soup(url)
+
+        # 检测验证码页面 - 百度会在频繁请求时返回安全验证页
+        if self._is_captcha_page(soup):
+            logger.warning("百度返回了验证码页面，可能被触发反爬机制（尝试等待后重试）")
+            raise SearchEngineBlockedError(f"百度搜索被验证码拦截，请稍后重试或切换搜索引擎。查询词：{query}")
+
         return self._parse_baidu_results(soup)
 
     def _get_soup(self, url: str, method: str = 'get', **kwargs) -> BeautifulSoup:
@@ -144,12 +167,29 @@ class SearchEngine:
         response.raise_for_status()
         return response
 
-    @staticmethod
-    def _check_content_type(response: requests.Response, url: str):
+    def _check_content_type(self, response: requests.Response, url: str):
         """检查响应的 Content-Type 是否为 HTML"""
         content_type = response.headers.get('Content-Type', '')
         if 'text/html' not in content_type and 'application/xhtml' not in content_type:
             logger.warning(f"URL {url} 返回了非HTML内容 (Content-Type: {content_type})")
+
+    @staticmethod
+    def _is_captcha_page(soup: BeautifulSoup) -> bool:
+        """检测页面是否为验证码页（百度等站点的安全拦截）"""
+        text = soup.get_text().lower()
+        # 常见验证码页面关键词
+        captcha_signals = [
+            '安全验证', 'captcha', '验证码', '滑动验证',
+            'robot', '人机识别', 'wappass', 'verify.baidu',
+            '请完成安全验证', 'verification', 'cloudflare'
+        ]
+        for signal in captcha_signals:
+            if signal.lower() in text:
+                return True
+        # 如果页面没有 h3+链接结构且标题是验证码相关则判定为验证码
+        result_count = len(soup.find_all(lambda t: t.name == 'h3' and t.find('a')))
+        has_title = bool(soup.title and '验证' in (soup.title.text or ''))
+        return result_count == 0 and has_title
 
     def _parse_google_results(self, soup: BeautifulSoup) -> List[Dict[str, str]]:
         """解析Google搜索结果"""
@@ -224,6 +264,19 @@ class SearchEngine:
             if not real_url:
                 continue
 
+            # 检查域名是否在黑名单中
+            if self._is_blocked_domain(real_url):
+                logger.debug(f"过滤黑名单域名: {title} -> {real_url[:60]}")
+                continue
+
+            # 过滤文件下载链接（PDF、EPUB等）
+            file_extensions = ('.pdf', '.epub', '.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx')
+            lower_url = real_url.lower()
+            has_file_ext = any(lower_url.endswith(ext) or f'{ext}?' in lower_url for ext in file_extensions)
+            if has_file_ext:
+                logger.debug(f"过滤文件类型: {title} -> {real_url[:60]}")
+                continue
+
             seen_titles.add(title)
             results.append({'title': title, 'link': real_url})
 
@@ -232,7 +285,6 @@ class SearchEngine:
     @staticmethod
     def _decode_bing_url(bing_href: str) -> Optional[str]:
         """从 Bing tracking link 中解码出真实URL（base64编码在 u= 参数中）"""
-        from urllib.parse import urlparse, parse_qs, unquote
         import base64
 
         parsed = urlparse(bing_href)
@@ -250,6 +302,23 @@ class SearchEngine:
         except Exception:
             logger.debug(f"Bing URL 解码失败：{encoded[:50]}...")
             return None
+
+    @staticmethod
+    def _get_domain(url: str) -> str:
+        """从URL中提取域名（小写），用于黑名单过滤"""
+        try:
+            netloc = urlparse(url).netloc.lower()
+            # 去掉 www. 前缀
+            if netloc.startswith('www.'):
+                netloc = netloc[4:]
+            return netloc
+        except Exception:
+            return ''
+
+    def _is_blocked_domain(self, url: str) -> bool:
+        """检查URL的域名是否在黑名单中"""
+        domain = self._get_domain(url)
+        return domain in self._BLOCKED_DOMAINS
 
     def _parse_baidu_results(self, soup: BeautifulSoup) -> List[Dict[str, str]]:
         """解析百度搜索结果。百度搜索返回的URL是跳转中间页，保留即可——get_content请求时会自动跟随302重定向到真实页面"""
@@ -281,9 +350,13 @@ class SearchEngine:
             real_link = None
             for a in child.find_all('a', href=True):
                 href = a['href']
-                if '/link?url=' in href or '/baidu.php?url=' in href:
+                if '/link?url=' in href:
                     real_link = href
                     break
+                # /baidu.php 是百度推广广告，直接过滤掉
+                elif '/baidu.php' in href:
+                    logger.debug(f"过滤广告（/baidu.php）: {title}")
+                    continue
 
             if real_link:
                 seen_titles.add(title)
@@ -293,7 +366,7 @@ class SearchEngine:
 
     def get_content(self, url: str) -> Optional[str]:
         """
-        获取网页内容。自动跟随 HTTP 302 重定向（百度/必应的跳转链接），过滤非 HTML 内容。
+        获取网页内容。自动跟随 HTTP 302 重定向（百度/必应的跳转链接），过滤非 HTML 内容和广告空壳页。
 
         :param url: 目标URL（支持搜索结果的中间跳转页）
         :return: 网页内容文本，如果发生错误或非HTML内容则返回None
@@ -301,22 +374,36 @@ class SearchEngine:
         try:
             sess = requests.Session()
             sess.headers.update(self.headers)
-            # follow_redirects=True 会自动跟踪百度的 /link?url= 和 /baidu.php?url=
             response = sess.get(url, timeout=self.DEFAULT_TIMEOUT, allow_redirects=True)
 
             content_type = response.headers.get('Content-Type', '')
-            # 只处理 HTML 和 UTF-8 编码的内容，跳过 PDF、图片等非 HTML 资源
+            # 只处理 HTML 内容，跳过 PDF、图片等非 HTML 资源
             if 'text/html' not in content_type and 'application/xhtml' not in content_type:
                 logger.debug(f"跳过非HTML内容：{url} (Content-Type: {content_type})")
                 return None
 
-            soup = BeautifulSoup(response.content, 'html.parser')
+            # 编码容错：手动指定 UTF-8，应对部分站点 charset 声明错误的情况
+            response.encoding = 'utf-8'
+
+            soup = BeautifulSoup(response.text, 'html.parser')
             # 移除脚本和样式标签
             for tag in soup(['script', 'style']):
                 tag.extract()
 
             paragraphs = soup.find_all(['p', 'span'])
-            content = ' '.join([p.get_text() for p in paragraphs])
+            text_parts = []
+            for p in paragraphs:
+                text = p.get_text(strip=True)
+                if text:
+                    text_parts.append(text)
+
+            content = ' '.join(text_parts)
+
+            # 内容过短视为垃圾页面（广告空壳、登录页等）
+            if len(content) < self.MIN_CONTENT_LENGTH:
+                logger.debug(f"内容太短({len(content)}字)，过滤：{url[:60]}...")
+                return None
+
             return self._trim_content(content)
         except Exception as e:
             logger.error(f"从 {url} 获取内容时发生错误：{str(e)}")
